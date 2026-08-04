@@ -1,7 +1,7 @@
 FROM nvidia/cuda:12.1.1-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
-RUN apt-get update && apt-get install -y python3 python3-pip espeak-ng ffmpeg wget git && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y python3 python3-pip espeak-ng ffmpeg wget git cmake ninja-build build-essential && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
