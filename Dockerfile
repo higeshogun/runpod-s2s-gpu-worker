@@ -15,6 +15,14 @@ RUN pip3 install --no-cache-dir -r requirements.txt
 RUN wget -O /app/gemma-4-E4B-it-Q4_0.gguf \
     https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF/resolve/main/gemma-4-E4B-it-Q4_0.gguf
 
+# Pre-download the faster-whisper STT model and Kokoro TTS weights at build time so cold
+# starts never have to hit the Hugging Face Hub over the network (this was previously
+# happening on every fresh worker, adding highly variable and sometimes multi-minute delays,
+# worsened by unauthenticated-request rate limiting).
+ARG STT_MODEL_SIZE=base
+RUN python3 -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='Systran/faster-whisper-${STT_MODEL_SIZE}')"
+RUN python3 -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='hexgrad/Kokoro-82M')"
+
 COPY handler.py /app/handler.py
 
 CMD ["python3", "-u", "/app/handler.py"]
