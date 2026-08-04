@@ -4,3 +4,5 @@ llama-cpp-python>=0.3.0
 soundfile
 numpy
 kokoro>=0.7.0
+misaki[ja,zh]
+langdetect
