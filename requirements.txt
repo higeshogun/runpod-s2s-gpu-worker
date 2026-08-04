@@ -1,0 +1,6 @@
+runpod>=1.6.0
+faster-whisper>=1.0.0
+llama-cpp-python>=0.3.0
+soundfile
+numpy
+kokoro>=0.7.0
