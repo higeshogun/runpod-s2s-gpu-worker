@@ -50,7 +50,6 @@ DEFAULT_KOKORO = ("a", "af_heart")
 
 _tts_pipelines = {}
 
-
 def get_tts_pipeline(kokoro_lang_code):
     pipeline = _tts_pipelines.get(kokoro_lang_code)
     if pipeline is not None:
@@ -71,11 +70,9 @@ def get_tts_pipeline(kokoro_lang_code):
     _tts_pipelines[kokoro_lang_code] = pipeline
     return pipeline
 
-
 _HIRAGANA_KATAKANA = re.compile(r"[\u3040-\u30ff]")
 _CJK = re.compile(r"[\u4e00-\u9fff]")
 _HANGUL = re.compile(r"[\uac00-\ud7a3]")
-
 
 def detect_kokoro_target(text):
     # Script-based checks first: langdetect is unreliable on short strings and
@@ -92,7 +89,6 @@ def detect_kokoro_target(text):
         return DEFAULT_KOKORO
     return LANG_TO_KOKORO.get(code, DEFAULT_KOKORO)
 
-
 # Pre-warm English at import time (required - if this fails there's no TTS at
 # all, so we let it raise). Pre-warm Japanese too, but never let a failure
 # here take down the whole worker - get_tts_pipeline() will fall back to
@@ -103,19 +99,43 @@ try:
 except Exception as e:
     print(f"[handler] Japanese TTS pipeline unavailable, will fall back to English: {e}", flush=True)
 
+def collapse_repetition(text):
+    # faster-whisper (especially the small "base" model) occasionally
+    # hallucinates by looping the same word/phrase over and over on short or
+    # ambiguous audio (e.g. "1.5% 1.5% 1.5% ... x7"). If the *entire*
+    # transcript is just N back-to-back repeats of a shorter phrase, collapse
+    # it down to a single occurrence rather than translating/speaking the
+    # repeated text N times.
+    words = text.split()
+    n = len(words)
+    if n < 2:
+        return text
+    for size in range(1, n // 2 + 1):
+        if n % size != 0:
+            continue
+        pattern = words[:size]
+        if pattern * (n // size) == words:
+            return " ".join(pattern)
+    return text
 
 def transcribe(audio_path):
-    segments, info = stt_model.transcribe(audio_path, beam_size=5)
+    segments, info = stt_model.transcribe(
+        audio_path,
+        beam_size=5,
+        condition_on_previous_text=False,
+        repetition_penalty=1.2,
+        no_repeat_ngram_size=3,
+        vad_filter=True,
+    )
     text = " ".join(seg.text.strip() for seg in segments).strip()
+    text = collapse_repetition(text)
     return text, info.language
-
 
 def call_llm(history, user_text, system_prompt=None):
     messages = [{"role": "system", "content": system_prompt or SYSTEM_PROMPT}, *history,
                 {"role": "user", "content": user_text}]
     result = llm.create_chat_completion(messages=messages, max_tokens=200)
     return result["choices"][0]["message"]["content"].strip()
-
 
 def synthesize(text):
     kokoro_lang_code, voice = detect_kokoro_target(text)
@@ -124,7 +144,6 @@ def synthesize(text):
     if not chunks:
         return np.zeros(1, dtype=np.float32), 24000
     return np.concatenate(chunks), 24000
-
 
 def handler(job):
     job_input = job["input"]
@@ -158,6 +177,5 @@ def handler(job):
         "response_audio_base64": response_audio_b64,
         "sample_rate": sample_rate,
     }
-
 
 runpod.serverless.start({"handler": handler})
