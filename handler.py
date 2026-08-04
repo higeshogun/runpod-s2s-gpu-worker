@@ -53,9 +53,22 @@ _tts_pipelines = {}
 
 def get_tts_pipeline(kokoro_lang_code):
     pipeline = _tts_pipelines.get(kokoro_lang_code)
-    if pipeline is None:
+    if pipeline is not None:
+        return pipeline
+    try:
         pipeline = KPipeline(lang_code=kokoro_lang_code)
-        _tts_pipelines[kokoro_lang_code] = pipeline
+    except Exception as e:
+        # Never let a missing/broken G2P dependency for one language (e.g. a
+        # non-English tokenizer's dictionary not being downloaded) crash or
+        # permanently break the worker. Fall back to English instead of
+        # raising, except for English itself which must always work.
+        print(f"[handler] failed to init Kokoro pipeline for lang_code={kokoro_lang_code!r}: {e}", flush=True)
+        if kokoro_lang_code == DEFAULT_KOKORO[0]:
+            raise
+        fallback = get_tts_pipeline(DEFAULT_KOKORO[0])
+        _tts_pipelines[kokoro_lang_code] = fallback
+        return fallback
+    _tts_pipelines[kokoro_lang_code] = pipeline
     return pipeline
 
 
@@ -80,10 +93,15 @@ def detect_kokoro_target(text):
     return LANG_TO_KOKORO.get(code, DEFAULT_KOKORO)
 
 
-# Pre-warm the two languages this deployment is actually used for so the first
-# turn in either direction doesn't pay pipeline-init latency mid-request.
+# Pre-warm English at import time (required - if this fails there's no TTS at
+# all, so we let it raise). Pre-warm Japanese too, but never let a failure
+# here take down the whole worker - get_tts_pipeline() will fall back to
+# English for every request until this is fixed, instead of crash-looping.
 get_tts_pipeline("a")
-get_tts_pipeline("j")
+try:
+    get_tts_pipeline("j")
+except Exception as e:
+    print(f"[handler] Japanese TTS pipeline unavailable, will fall back to English: {e}", flush=True)
 
 
 def transcribe(audio_path):
