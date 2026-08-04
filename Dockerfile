@@ -23,6 +23,12 @@ ARG STT_MODEL_SIZE=base
 RUN python3 -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='Systran/faster-whisper-${STT_MODEL_SIZE}')"
 RUN python3 -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='hexgrad/Kokoro-82M')"
 
+# Pre-warm the Kokoro/misaki G2P pipelines used by this deployment (English + Japanese).
+# The Japanese tokenizer (pyopenjtalk + unidic) fetches its dictionary on first use, so
+# without this it would silently re-download at runtime on every fresh cold-start worker,
+# same class of bug as the STT/TTS weights above.
+RUN python3 -c "from kokoro import KPipeline; KPipeline(lang_code='a'); KPipeline(lang_code='j')"
+
 COPY handler.py /app/handler.py
 
 CMD ["python3", "-u", "/app/handler.py"]
