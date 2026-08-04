@@ -23,10 +23,14 @@ ARG STT_MODEL_SIZE=base
 RUN python3 -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='Systran/faster-whisper-${STT_MODEL_SIZE}')"
 RUN python3 -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='hexgrad/Kokoro-82M')"
 
-# Pre-warm the Kokoro/misaki G2P pipelines used by this deployment (English + Japanese).
-# The Japanese tokenizer (pyopenjtalk + unidic) fetches its dictionary on first use, so
-# without this it would silently re-download at runtime on every fresh cold-start worker,
-# same class of bug as the STT/TTS weights above.
+# misaki's Japanese G2P uses fugashi/MeCab, which needs the unidic dictionary data
+# downloaded separately (the pip package ships without it). Without this, MeCab
+# fails to initialize at runtime with "Failed initializing MeCab" and crashes the
+# worker on every startup.
+RUN python3 -m unidic download
+
+# Pre-warm the Kokoro/misaki G2P pipelines used by this deployment (English + Japanese)
+# so the first request in either language doesn't pay pipeline-init latency mid-request.
 RUN python3 -c "from kokoro import KPipeline; KPipeline(lang_code='a'); KPipeline(lang_code='j')"
 
 COPY handler.py /app/handler.py
