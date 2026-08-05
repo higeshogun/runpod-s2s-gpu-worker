@@ -1,13 +1,12 @@
 import os
 import re
 import base64
-import io
 import tempfile
+import traceback
 
 import runpod
 from faster_whisper import WhisperModel
 from llama_cpp import Llama
-import soundfile as sf
 import numpy as np
 from kokoro import KPipeline
 from langdetect import detect, DetectorFactory
@@ -29,6 +28,8 @@ SYSTEM_PROMPT = os.environ.get(
     "SYSTEM_PROMPT",
     "You are a helpful, concise voice assistant. Keep replies short and conversational.",
 )
+
+TTS_SAMPLE_RATE = 24000
 
 # The interpreter is bidirectional (e.g. English<->Japanese), so the TTS output
 # language changes turn to turn. Kokoro needs a pipeline + matching voice per
@@ -109,8 +110,7 @@ def collapse_repetition(text):
     # hallucinates by looping the same word/phrase over and over on short or
     # ambiguous audio (e.g. "1.5% 1.5% 1.5% ... x7"). If the *entire*
     # transcript is just N back-to-back repeats of a shorter phrase, collapse
-    # it down to a single occurrence rather than translating/speaking the
-    # repeated text N times.
+    # it down to a single occurrence.
     words = text.split()
     n = len(words)
     if n < 2:
@@ -124,34 +124,19 @@ def collapse_repetition(text):
     return text
 
 
-def collapse_sentence_repetition(text):
-    # Same idea one level up: a small quantized model asked to translate can
-    # emit the translated sentence two or three times in a row, which then gets
-    # synthesized and sounds like the reply is repeating itself.
-    parts = [p.strip() for p in re.split(r"(?<=[.!?\u3002\uff01\uff1f])\s*", text) if p.strip()]
-    if len(parts) < 2:
-        return text
-    deduped = []
-    for part in parts:
-        if not deduped or part != deduped[-1]:
-            deduped.append(part)
-    return " ".join(deduped)
-
-
 _LABEL_PREFIX = re.compile(
     r"^\s*(translation|translated|english|japanese|output|answer|reply)\s*[:\-]\s*",
     re.IGNORECASE,
 )
+_OPEN_QUOTES = "\"'\u201c\u300c"
+_CLOSE_QUOTES = "\"'\u201d\u300d"
 
 
-def clean_response(text):
+def strip_wrapping_quotes(text):
     text = text.strip()
-    text = _LABEL_PREFIX.sub("", text)
-    # Strip a wrapping pair of quotes the model sometimes adds around the
-    # translation; spoken aloud these become audible artifacts.
-    if len(text) >= 2 and text[0] in "\"'\u201c\u300c" and text[-1] in "\"'\u201d\u300d":
-        text = text[1:-1].strip()
-    return collapse_sentence_repetition(text)
+    if len(text) >= 2 and text[0] in _OPEN_QUOTES and text[-1] in _CLOSE_QUOTES:
+        return text[1:-1].strip()
+    return text
 
 
 def transcribe(audio_path):
@@ -164,70 +149,149 @@ def transcribe(audio_path):
         vad_filter=True,
     )
     text = " ".join(seg.text.strip() for seg in segments).strip()
-    text = collapse_repetition(text)
-    return text, info.language
+    return collapse_repetition(text), info.language
 
 
-def call_llm(history, user_text, system_prompt=None):
+def llm_deltas(history, user_text, system_prompt=None):
     messages = [{"role": "system", "content": system_prompt or SYSTEM_PROMPT}, *history,
                 {"role": "user", "content": user_text}]
-    # Translation is not a creative task. The default sampling temperature made
-    # the model paraphrase, add commentary, and sometimes restate the same
-    # sentence; near-greedy decoding with a repeat penalty keeps it literal.
-    result = llm.create_chat_completion(
+    # Translation is not a creative task: near-greedy decoding with a repeat
+    # penalty keeps the model literal instead of paraphrasing or restating.
+    for part in llm.create_chat_completion(
         messages=messages,
         max_tokens=256,
         temperature=0.2,
         top_p=0.9,
         repeat_penalty=1.15,
-    )
-    return clean_response(result["choices"][0]["message"]["content"])
+        stream=True,
+    ):
+        choice = (part.get("choices") or [{}])[0]
+        content = (choice.get("delta") or {}).get("content")
+        if content:
+            yield content
 
 
-def synthesize(text):
+# Sentence terminators for Latin and CJK punctuation, including any closing
+# quote/bracket that follows them.
+_SENTENCE_END = re.compile(r"[.!?\u3002\uff01\uff1f\uff0e][\"'\u201d\u300d)\uff09]*")
+MIN_SENTENCE_CHARS = 8
+MAX_SENTENCE_CHARS = 140
+
+
+def stream_sentences(delta_iter):
+    # Emit complete sentences as soon as the model produces them so the first
+    # chunk of speech can be synthesized and played while the rest is still
+    # being generated. This is what turns a batch turn into a streaming one.
+    buf = ""
+    for delta in delta_iter:
+        buf += delta
+        while True:
+            match = None
+            for candidate in _SENTENCE_END.finditer(buf):
+                if candidate.end() >= MIN_SENTENCE_CHARS:
+                    match = candidate
+                    break
+            if match is None:
+                break
+            sentence, buf = buf[:match.end()].strip(), buf[match.end():]
+            if sentence:
+                yield sentence
+        if len(buf) >= MAX_SENTENCE_CHARS:
+            cut = buf.rfind(" ", 0, MAX_SENTENCE_CHARS)
+            if cut <= 0:
+                cut = MAX_SENTENCE_CHARS
+            sentence, buf = buf[:cut].strip(), buf[cut:]
+            if sentence:
+                yield sentence
+    tail = buf.strip()
+    if tail:
+        yield tail
+
+
+def to_pcm16_bytes(audio):
+    samples = np.asarray(audio, dtype=np.float32).reshape(-1)
+    if not samples.size:
+        return b""
+    clipped = np.clip(samples, -1.0, 1.0)
+    return (clipped * 32767.0).astype(np.int16).tobytes()
+
+
+def synthesize_chunks(text):
     kokoro_lang_code, voice = detect_kokoro_target(text)
     pipeline = get_tts_pipeline(kokoro_lang_code)
-    chunks = [audio for _, _, audio in pipeline(text, voice=voice)]
-    if not chunks:
-        return np.zeros(1, dtype=np.float32), 24000
-    return np.concatenate(chunks), 24000
+    for _, _, audio in pipeline(text, voice=voice):
+        if audio is None:
+            continue
+        pcm = to_pcm16_bytes(audio)
+        if pcm:
+            yield pcm
 
 
 def handler(job):
-    job_input = job["input"]
+    # Generator handler: every yielded dict is delivered to the relay through
+    # RunPod's /stream endpoint as soon as it is produced, instead of the whole
+    # turn being withheld until synthesis finishes.
+    job_input = job.get("input") or {}
+
+    if job_input.get("warmup"):
+        # Cheap no-op request used to bring a worker up before the first real
+        # utterance, so the user doesn't pay the cold start mid-conversation.
+        yield {"type": "warmup", "ready": True}
+        return
+
     audio_b64 = job_input.get("audio_base64")
     if not audio_b64:
-        return {"error": "audio_base64 is required"}
+        yield {"type": "error", "message": "audio_base64 is required"}
+        return
 
     history = job_input.get("history", [])
     instructions = job_input.get("instructions")
 
-    audio_bytes = base64.b64decode(audio_b64)
-    with tempfile.NamedTemporaryFile(suffix=".wav") as tmp:
-        tmp.write(audio_bytes)
-        tmp.flush()
-        user_text, detected_language = transcribe(tmp.name)
+    try:
+        audio_bytes = base64.b64decode(audio_b64)
+        with tempfile.NamedTemporaryFile(suffix=".wav") as tmp:
+            tmp.write(audio_bytes)
+            tmp.flush()
+            user_text, detected_language = transcribe(tmp.name)
 
-    if not user_text:
-        return {"transcript": "", "response_text": "", "response_audio_base64": ""}
+        yield {"type": "transcript", "transcript": user_text, "detected_language": detected_language}
+        if not user_text:
+            yield {"type": "done"}
+            return
 
-    response_text = call_llm(history, user_text, system_prompt=instructions)
-    if not response_text:
-        return {"transcript": user_text, "response_text": "", "response_audio_base64": ""}
+        spoken_any = False
+        last_sentence = None
+        first = True
+        for sentence in stream_sentences(llm_deltas(history, user_text, system_prompt=instructions)):
+            if first:
+                sentence = _LABEL_PREFIX.sub("", sentence)
+                first = False
+            sentence = strip_wrapping_quotes(sentence)
+            if not sentence or sentence == last_sentence:
+                continue  # a small quantized model sometimes restates a sentence
+            last_sentence = sentence
 
-    audio_array, sample_rate = synthesize(response_text)
+            yield {"type": "text", "text": sentence}
+            try:
+                for pcm in synthesize_chunks(sentence):
+                    spoken_any = True
+                    yield {
+                        "type": "audio",
+                        "audio_base64": base64.b64encode(pcm).decode(),
+                        "sample_rate": TTS_SAMPLE_RATE,
+                    }
+            except Exception as e:
+                print(f"[handler] synthesis failed for a sentence: {e}", flush=True)
+                traceback.print_exc()
 
-    buf = io.BytesIO()
-    sf.write(buf, audio_array, sample_rate, format="WAV")
-    response_audio_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-
-    return {
-        "transcript": user_text,
-        "detected_language": detected_language,
-        "response_text": response_text,
-        "response_audio_base64": response_audio_b64,
-        "sample_rate": sample_rate,
-    }
+        if not spoken_any:
+            print("[handler] turn produced no audio", flush=True)
+        yield {"type": "done"}
+    except Exception as e:
+        print(f"[handler] turn failed: {e}", flush=True)
+        traceback.print_exc()
+        yield {"type": "error", "message": str(e)}
+        yield {"type": "done"}
 
 
-runpod.serverless.start({"handler": handler})
+runpod.serverless.start({"handler": handler, "return_aggregate_stream": True})
