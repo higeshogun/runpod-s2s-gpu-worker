@@ -50,6 +50,7 @@ DEFAULT_KOKORO = ("a", "af_heart")
 
 _tts_pipelines = {}
 
+
 def get_tts_pipeline(kokoro_lang_code):
     pipeline = _tts_pipelines.get(kokoro_lang_code)
     if pipeline is not None:
@@ -70,9 +71,11 @@ def get_tts_pipeline(kokoro_lang_code):
     _tts_pipelines[kokoro_lang_code] = pipeline
     return pipeline
 
+
 _HIRAGANA_KATAKANA = re.compile(r"[\u3040-\u30ff]")
 _CJK = re.compile(r"[\u4e00-\u9fff]")
 _HANGUL = re.compile(r"[\uac00-\ud7a3]")
+
 
 def detect_kokoro_target(text):
     # Script-based checks first: langdetect is unreliable on short strings and
@@ -89,6 +92,7 @@ def detect_kokoro_target(text):
         return DEFAULT_KOKORO
     return LANG_TO_KOKORO.get(code, DEFAULT_KOKORO)
 
+
 # Pre-warm English at import time (required - if this fails there's no TTS at
 # all, so we let it raise). Pre-warm Japanese too, but never let a failure
 # here take down the whole worker - get_tts_pipeline() will fall back to
@@ -98,6 +102,7 @@ try:
     get_tts_pipeline("j")
 except Exception as e:
     print(f"[handler] Japanese TTS pipeline unavailable, will fall back to English: {e}", flush=True)
+
 
 def collapse_repetition(text):
     # faster-whisper (especially the small "base" model) occasionally
@@ -118,6 +123,37 @@ def collapse_repetition(text):
             return " ".join(pattern)
     return text
 
+
+def collapse_sentence_repetition(text):
+    # Same idea one level up: a small quantized model asked to translate can
+    # emit the translated sentence two or three times in a row, which then gets
+    # synthesized and sounds like the reply is repeating itself.
+    parts = [p.strip() for p in re.split(r"(?<=[.!?\u3002\uff01\uff1f])\s*", text) if p.strip()]
+    if len(parts) < 2:
+        return text
+    deduped = []
+    for part in parts:
+        if not deduped or part != deduped[-1]:
+            deduped.append(part)
+    return " ".join(deduped)
+
+
+_LABEL_PREFIX = re.compile(
+    r"^\s*(translation|translated|english|japanese|output|answer|reply)\s*[:\-]\s*",
+    re.IGNORECASE,
+)
+
+
+def clean_response(text):
+    text = text.strip()
+    text = _LABEL_PREFIX.sub("", text)
+    # Strip a wrapping pair of quotes the model sometimes adds around the
+    # translation; spoken aloud these become audible artifacts.
+    if len(text) >= 2 and text[0] in "\"'\u201c\u300c" and text[-1] in "\"'\u201d\u300d":
+        text = text[1:-1].strip()
+    return collapse_sentence_repetition(text)
+
+
 def transcribe(audio_path):
     segments, info = stt_model.transcribe(
         audio_path,
@@ -131,11 +167,22 @@ def transcribe(audio_path):
     text = collapse_repetition(text)
     return text, info.language
 
+
 def call_llm(history, user_text, system_prompt=None):
     messages = [{"role": "system", "content": system_prompt or SYSTEM_PROMPT}, *history,
                 {"role": "user", "content": user_text}]
-    result = llm.create_chat_completion(messages=messages, max_tokens=200)
-    return result["choices"][0]["message"]["content"].strip()
+    # Translation is not a creative task. The default sampling temperature made
+    # the model paraphrase, add commentary, and sometimes restate the same
+    # sentence; near-greedy decoding with a repeat penalty keeps it literal.
+    result = llm.create_chat_completion(
+        messages=messages,
+        max_tokens=256,
+        temperature=0.2,
+        top_p=0.9,
+        repeat_penalty=1.15,
+    )
+    return clean_response(result["choices"][0]["message"]["content"])
+
 
 def synthesize(text):
     kokoro_lang_code, voice = detect_kokoro_target(text)
@@ -144,6 +191,7 @@ def synthesize(text):
     if not chunks:
         return np.zeros(1, dtype=np.float32), 24000
     return np.concatenate(chunks), 24000
+
 
 def handler(job):
     job_input = job["input"]
@@ -164,6 +212,9 @@ def handler(job):
         return {"transcript": "", "response_text": "", "response_audio_base64": ""}
 
     response_text = call_llm(history, user_text, system_prompt=instructions)
+    if not response_text:
+        return {"transcript": user_text, "response_text": "", "response_audio_base64": ""}
+
     audio_array, sample_rate = synthesize(response_text)
 
     buf = io.BytesIO()
@@ -177,5 +228,6 @@ def handler(job):
         "response_audio_base64": response_audio_b64,
         "sample_rate": sample_rate,
     }
+
 
 runpod.serverless.start({"handler": handler})
