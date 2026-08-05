@@ -13,8 +13,18 @@ from langdetect import detect, DetectorFactory
 
 DetectorFactory.seed = 0  # deterministic langdetect results
 
-STT_MODEL_SIZE = os.environ.get("STT_MODEL_SIZE", "base")
-stt_model = WhisperModel(STT_MODEL_SIZE, device="cuda", compute_type="float16")
+# large-v3-turbo is Whisper large-v3 with the decoder distilled from 32 layers
+# down to 4: it keeps large-v3-class accuracy while decoding fast enough for
+# realtime, and it stays multilingual (unlike the distil-* checkpoints, which
+# are English only) so it serves both directions of the interpreter. The old
+# default was "base", which looped hallucinated phrases and returned empty
+# transcripts on a large share of Japanese turns.
+STT_MODEL_SIZE = os.environ.get("STT_MODEL_SIZE", "large-v3-turbo")
+STT_COMPUTE_TYPE = os.environ.get("STT_COMPUTE_TYPE", "float16")
+# Greedy decoding: beam search costs real latency and buys very little on the
+# short single-utterance clips the relay sends.
+STT_BEAM_SIZE = int(os.environ.get("STT_BEAM_SIZE", "1"))
+stt_model = WhisperModel(STT_MODEL_SIZE, device="cuda", compute_type=STT_COMPUTE_TYPE)
 
 LLM_GGUF_PATH = os.environ.get("LLM_GGUF_PATH", "/app/gemma-4-E4B-it-Q4_0.gguf")
 llm = Llama(
@@ -30,6 +40,14 @@ SYSTEM_PROMPT = os.environ.get(
 )
 
 TTS_SAMPLE_RATE = 24000
+TTS_SPEED = float(os.environ.get("TTS_SPEED", "1.0"))
+# ~200 ms of audio per streamed chunk: small enough that playback starts as soon
+# as the first syllable exists, large enough not to flood the relay.
+TTS_CHUNK_SAMPLES = int(TTS_SAMPLE_RATE * 0.2)
+TTS_FADE_SAMPLES = int(TTS_SAMPLE_RATE * 0.005)  # 5 ms de-click ramp
+TTS_KEEP_SILENCE_SAMPLES = int(TTS_SAMPLE_RATE * 0.02)
+TTS_SILENCE_FLOOR = 0.004
+TTS_TARGET_PEAK = float(os.environ.get("TTS_TARGET_PEAK", "0.95"))
 
 # The interpreter is bidirectional (e.g. English<->Japanese), so the TTS output
 # language changes turn to turn. Kokoro needs a pipeline + matching voice per
@@ -106,11 +124,9 @@ except Exception as e:
 
 
 def collapse_repetition(text):
-    # faster-whisper (especially the small "base" model) occasionally
-    # hallucinates by looping the same word/phrase over and over on short or
-    # ambiguous audio (e.g. "1.5% 1.5% 1.5% ... x7"). If the *entire*
-    # transcript is just N back-to-back repeats of a shorter phrase, collapse
-    # it down to a single occurrence.
+    # Whisper occasionally hallucinates by looping the same word/phrase over and
+    # over on short or ambiguous audio. If the *entire* transcript is just N
+    # back-to-back repeats of a shorter phrase, collapse it to one occurrence.
     words = text.split()
     n = len(words)
     if n < 2:
@@ -139,15 +155,41 @@ def strip_wrapping_quotes(text):
     return text
 
 
-def transcribe(audio_path):
-    segments, info = stt_model.transcribe(
-        audio_path,
-        beam_size=5,
-        condition_on_previous_text=False,
-        repetition_penalty=1.2,
-        no_repeat_ngram_size=3,
-        vad_filter=True,
-    )
+_STT_DECODE_OPTS = dict(
+    beam_size=STT_BEAM_SIZE,
+    condition_on_previous_text=False,
+    repetition_penalty=1.2,
+    no_repeat_ngram_size=3,
+    vad_filter=True,
+)
+
+
+def choose_language(info, allowed):
+    # Whisper's language ID runs over all 99 languages and gets short clips wrong
+    # often enough to matter - a Japanese sentence detected as Korean comes back
+    # as garbage. A session only ever involves two languages, so restrict the
+    # choice to those and take the most probable one.
+    if not allowed:
+        return None
+    if info.language in allowed:
+        return info.language
+    for code, _prob in (getattr(info, "all_language_probs", None) or []):
+        if code in allowed:
+            return code
+    return allowed[0]
+
+
+def transcribe(audio_path, allowed_languages=None):
+    allowed = [code for code in (allowed_languages or []) if code]
+    # transcribe() returns the detected-language info immediately; decoding only
+    # happens as the segment generator is consumed. So we can inspect the
+    # detection and, when it lands outside the session's languages, redo the
+    # call with the right one forced without ever decoding the wrong text.
+    segments, info = stt_model.transcribe(audio_path, language=None, **_STT_DECODE_OPTS)
+    language = choose_language(info, allowed)
+    if language and language != info.language:
+        print(f"[handler] detected {info.language!r} outside session {allowed}; forcing {language!r}", flush=True)
+        segments, info = stt_model.transcribe(audio_path, language=language, **_STT_DECODE_OPTS)
     text = " ".join(seg.text.strip() for seg in segments).strip()
     return collapse_repetition(text), info.language
 
@@ -208,21 +250,71 @@ def stream_sentences(delta_iter):
         yield tail
 
 
-def to_pcm16_bytes(audio):
-    samples = np.asarray(audio, dtype=np.float32).reshape(-1)
+def trim_silence(samples):
+    # Kokoro pads every utterance with a stretch of near-silence. Left in place
+    # it becomes a dead gap between each sentence, which is a large part of why
+    # the interpreter sounded slow and disjointed.
+    if not samples.size:
+        return samples
+    loud = np.nonzero(np.abs(samples) > TTS_SILENCE_FLOOR)[0]
+    if not loud.size:
+        return samples[:0]
+    start = max(0, int(loud[0]) - TTS_KEEP_SILENCE_SAMPLES)
+    end = min(samples.size, int(loud[-1]) + 1 + TTS_KEEP_SILENCE_SAMPLES)
+    return samples[start:end]
+
+
+def apply_fades(samples):
+    # A sentence that starts or ends on a non-zero sample clicks audibly when the
+    # player concatenates it with the next one.
+    n = min(TTS_FADE_SAMPLES, samples.size // 2)
+    if n <= 0:
+        return samples
+    ramp = np.linspace(0.0, 1.0, n, dtype=np.float32)
+    out = samples.copy()
+    out[:n] *= ramp
+    out[-n:] *= ramp[::-1]
+    return out
+
+
+def normalize(samples):
+    # Kokoro's output level varies between voices and between sentences, which
+    # made the translated speech quiet and inconsistent. Peak-normalize toward a
+    # fixed target, with the gain clamped so a quiet sentence can't be blown up.
+    if not samples.size:
+        return samples
+    peak = float(np.max(np.abs(samples)))
+    if peak <= 1e-4:
+        return samples
+    gain = min(max(TTS_TARGET_PEAK / peak, 0.5), 3.0)
+    return samples * gain
+
+
+def to_pcm16_bytes(samples):
     if not samples.size:
         return b""
     clipped = np.clip(samples, -1.0, 1.0)
-    return (clipped * 32767.0).astype(np.int16).tobytes()
+    # Round rather than truncate: astype() alone throws away up to a full LSB on
+    # every sample, which is just added quantization noise.
+    return np.round(clipped * 32767.0).astype(np.int16).tobytes()
 
 
 def synthesize_chunks(text):
     kokoro_lang_code, voice = detect_kokoro_target(text)
     pipeline = get_tts_pipeline(kokoro_lang_code)
-    for _, _, audio in pipeline(text, voice=voice):
+    parts = []
+    for _, _, audio in pipeline(text, voice=voice, speed=TTS_SPEED):
         if audio is None:
             continue
-        pcm = to_pcm16_bytes(audio)
+        parts.append(np.asarray(audio, dtype=np.float32).reshape(-1))
+    if not parts:
+        return
+    samples = parts[0] if len(parts) == 1 else np.concatenate(parts)
+    # Clean up the whole sentence before slicing it: trimming and fading have to
+    # see the real start and end of the utterance, not an arbitrary chunk edge.
+    samples = normalize(apply_fades(trim_silence(samples)))
+    for start in range(0, samples.size, TTS_CHUNK_SAMPLES):
+        pcm = to_pcm16_bytes(samples[start:start + TTS_CHUNK_SAMPLES])
         if pcm:
             yield pcm
 
@@ -246,13 +338,14 @@ def handler(job):
 
     history = job_input.get("history", [])
     instructions = job_input.get("instructions")
+    languages = job_input.get("languages")
 
     try:
         audio_bytes = base64.b64decode(audio_b64)
         with tempfile.NamedTemporaryFile(suffix=".wav") as tmp:
             tmp.write(audio_bytes)
             tmp.flush()
-            user_text, detected_language = transcribe(tmp.name)
+            user_text, detected_language = transcribe(tmp.name, languages)
 
         yield {"type": "transcript", "transcript": user_text, "detected_language": detected_language}
         if not user_text:
