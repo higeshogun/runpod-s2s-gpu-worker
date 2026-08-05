@@ -1,5 +1,7 @@
 runpod>=1.6.0
-faster-whisper>=1.0.0
+# 1.1.0 is the first release that maps the "large-v3-turbo" name to the
+# CTranslate2 turbo weights (they live outside the Systran org).
+faster-whisper>=1.1.0
 llama-cpp-python>=0.3.0
 soundfile
 numpy
