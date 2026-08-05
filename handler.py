@@ -67,8 +67,25 @@ LANG_TO_KOKORO = {
 }
 DEFAULT_KOKORO = ("a", "af_heart")
 
-_tts_pipelines = {}
+# Human-readable language names for building an explicit "translate INTO X"
+# instruction when we have to correct a turn the model got wrong.
+LANG_LABELS = {
+    "en": "English",
+    "ja": "Japanese",
+    "zh": "Chinese",
+    "zh-cn": "Chinese",
+    "ko": "Korean",
+    "fr": "French",
+    "es": "Spanish",
+    "it": "Italian",
+    "pt": "Portuguese",
+    "de": "German",
+    "hi": "Hindi",
+    "ru": "Russian",
+    "ar": "Arabic",
+}
 
+_tts_pipelines = {}
 
 def get_tts_pipeline(kokoro_lang_code):
     pipeline = _tts_pipelines.get(kokoro_lang_code)
@@ -90,11 +107,9 @@ def get_tts_pipeline(kokoro_lang_code):
     _tts_pipelines[kokoro_lang_code] = pipeline
     return pipeline
 
-
 _HIRAGANA_KATAKANA = re.compile(r"[\u3040-\u30ff]")
 _CJK = re.compile(r"[\u4e00-\u9fff]")
 _HANGUL = re.compile(r"[\uac00-\ud7a3]")
-
 
 def detect_kokoro_target(text):
     # Script-based checks first: langdetect is unreliable on short strings and
@@ -111,6 +126,52 @@ def detect_kokoro_target(text):
         return DEFAULT_KOKORO
     return LANG_TO_KOKORO.get(code, DEFAULT_KOKORO)
 
+def text_script_language(text):
+    # Best-effort language code for a piece of text, using unambiguous scripts
+    # first (the same ordering detect_kokoro_target relies on) and falling back
+    # to langdetect for Latin-script languages. Returns None when undecidable.
+    if _HIRAGANA_KATAKANA.search(text):
+        return "ja"
+    if _HANGUL.search(text):
+        return "ko"
+    if _CJK.search(text):
+        return "zh"
+    stripped = text.strip()
+    if not stripped:
+        return None
+    try:
+        return detect(stripped)
+    except Exception:
+        return None
+
+def other_language(detected, allowed):
+    # The interpreter is strictly two-way, so the target language is simply the
+    # session language that is NOT the one that was spoken. Fall back to English
+    # when the pair is unknown or degenerate.
+    codes = [c for c in (allowed or []) if c]
+    for code in codes:
+        if code != detected:
+            return code
+    return "en" if detected != "en" else (codes[0] if codes else "en")
+
+def looks_like_echo(output_text, source_lang, target_lang):
+    # True when the model returned text in the SOURCE language instead of the
+    # target - i.e. it echoed/paraphrased the input rather than translating it.
+    # This is the JA->EN failure: Whisper hears Japanese, the model restates it
+    # in Japanese, and script-based TTS then speaks it back in Japanese.
+    lang = text_script_language(output_text)
+    if lang is None:
+        return False
+    # Normalize Chinese variants so "zh-cn" and "zh" compare equal.
+    norm = lambda c: "zh" if (c or "").startswith("zh") else c
+    if norm(lang) == norm(target_lang):
+        return False
+    if norm(lang) == norm(source_lang):
+        return True
+    # For CJK targets, a Latin-script answer is fine (names/loanwords); only
+    # treat an unambiguous source-script match as an echo. Anything else we
+    # leave alone rather than risk fighting correct output.
+    return False
 
 # Pre-warm English at import time (required - if this fails there's no TTS at
 # all, so we let it raise). Pre-warm Japanese too, but never let a failure
@@ -121,7 +182,6 @@ try:
     get_tts_pipeline("j")
 except Exception as e:
     print(f"[handler] Japanese TTS pipeline unavailable, will fall back to English: {e}", flush=True)
-
 
 def collapse_repetition(text):
     # Whisper occasionally hallucinates by looping the same word/phrase over and
@@ -139,7 +199,6 @@ def collapse_repetition(text):
             return " ".join(pattern)
     return text
 
-
 _LABEL_PREFIX = re.compile(
     r"^\s*(translation|translated|english|japanese|output|answer|reply)\s*[:\-]\s*",
     re.IGNORECASE,
@@ -147,13 +206,11 @@ _LABEL_PREFIX = re.compile(
 _OPEN_QUOTES = "\"'\u201c\u300c"
 _CLOSE_QUOTES = "\"'\u201d\u300d"
 
-
 def strip_wrapping_quotes(text):
     text = text.strip()
     if len(text) >= 2 and text[0] in _OPEN_QUOTES and text[-1] in _CLOSE_QUOTES:
         return text[1:-1].strip()
     return text
-
 
 _STT_DECODE_OPTS = dict(
     beam_size=STT_BEAM_SIZE,
@@ -162,7 +219,6 @@ _STT_DECODE_OPTS = dict(
     no_repeat_ngram_size=3,
     vad_filter=True,
 )
-
 
 def choose_language(info, allowed):
     # Whisper's language ID runs over all 99 languages and gets short clips wrong
@@ -178,7 +234,6 @@ def choose_language(info, allowed):
             return code
     return allowed[0]
 
-
 def transcribe(audio_path, allowed_languages=None):
     allowed = [code for code in (allowed_languages or []) if code]
     # transcribe() returns the detected-language info immediately; decoding only
@@ -193,25 +248,62 @@ def transcribe(audio_path, allowed_languages=None):
     text = " ".join(seg.text.strip() for seg in segments).strip()
     return collapse_repetition(text), info.language
 
+def build_system_prompt(base, target_lang):
+    # Reinforce the required output language on top of whatever bidirectional
+    # persona the client sent. A small quantized model (Gemma-4-E4B) will often
+    # echo/paraphrase the source when translating INTO English from a non-Latin
+    # language, because copying is the locally cheapest continuation; naming the
+    # target explicitly makes the correct direction the expected one.
+    base = base or SYSTEM_PROMPT
+    label = LANG_LABELS.get(target_lang)
+    if not label:
+        return base
+    return (
+        f"{base}\n\nThe person just spoke. Output ONLY the {label} translation of "
+        f"what they said. Do not reply in any other language. Do not repeat or "
+        f"paraphrase their words in the original language. Output only the "
+        f"{label} translation, with no preface, label, or commentary."
+    )
 
-def llm_deltas(history, user_text, system_prompt=None):
-    messages = [{"role": "system", "content": system_prompt or SYSTEM_PROMPT}, *history,
+def run_llm(user_text, system_prompt, temperature=0.2, repeat_penalty=1.15):
+    messages = [{"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_text}]
-    # Translation is not a creative task: near-greedy decoding with a repeat
-    # penalty keeps the model literal instead of paraphrasing or restating.
+    out = []
     for part in llm.create_chat_completion(
         messages=messages,
         max_tokens=256,
-        temperature=0.2,
+        temperature=temperature,
         top_p=0.9,
-        repeat_penalty=1.15,
+        repeat_penalty=repeat_penalty,
         stream=True,
     ):
         choice = (part.get("choices") or [{}])[0]
         content = (choice.get("delta") or {}).get("content")
         if content:
-            yield content
+            out.append(content)
+    return "".join(out).strip()
 
+def translate(user_text, base_instructions, source_lang, target_lang):
+    # Do NOT feed conversation history: this is a stateless per-turn interpreter.
+    # First pass uses the (target-reinforced) persona. If the model echoed the
+    # source language instead of translating, re-run once with a harder, more
+    # explicit instruction and slightly different decoding to break the copy.
+    prompt = build_system_prompt(base_instructions, target_lang)
+    text = run_llm(user_text, prompt)
+    if target_lang and looks_like_echo(text, source_lang, target_lang):
+        label = LANG_LABELS.get(target_lang, target_lang)
+        print(f"[handler] output looked like {source_lang!r} echo; forcing {target_lang!r} retranslate", flush=True)
+        hard_prompt = (
+            f"You are a translation engine. Translate the user's message into {label}. "
+            f"Respond with ONLY the {label} translation and nothing else. "
+            f"Never answer, never reply in the original language, never add commentary."
+        )
+        retry = run_llm(user_text, hard_prompt, temperature=0.3, repeat_penalty=1.3)
+        if retry and not looks_like_echo(retry, source_lang, target_lang):
+            text = retry
+        elif retry:
+            text = retry  # still not ideal, but the hard prompt is our best shot
+    return text
 
 # Sentence terminators for Latin and CJK punctuation, including any closing
 # quote/bracket that follows them.
@@ -219,36 +311,33 @@ _SENTENCE_END = re.compile(r"[.!?\u3002\uff01\uff1f\uff0e][\"'\u201d\u300d)\uff0
 MIN_SENTENCE_CHARS = 8
 MAX_SENTENCE_CHARS = 140
 
-
-def stream_sentences(delta_iter):
-    # Emit complete sentences as soon as the model produces them so the first
-    # chunk of speech can be synthesized and played while the rest is still
-    # being generated. This is what turns a batch turn into a streaming one.
-    buf = ""
-    for delta in delta_iter:
-        buf += delta
-        while True:
-            match = None
-            for candidate in _SENTENCE_END.finditer(buf):
-                if candidate.end() >= MIN_SENTENCE_CHARS:
-                    match = candidate
-                    break
-            if match is None:
+def stream_sentences(text):
+    # Split a completed translation into speakable sentences so each can be
+    # synthesized and streamed as soon as it is ready. (The translation is now
+    # produced whole - rather than token-streamed - because the echo guard has
+    # to see the full output before we commit to synthesizing it.)
+    buf = text
+    while True:
+        match = None
+        for candidate in _SENTENCE_END.finditer(buf):
+            if candidate.end() >= MIN_SENTENCE_CHARS:
+                match = candidate
                 break
-            sentence, buf = buf[:match.end()].strip(), buf[match.end():]
-            if sentence:
-                yield sentence
-        if len(buf) >= MAX_SENTENCE_CHARS:
+        if match is None:
+            break
+        sentence, buf = buf[:match.end()].strip(), buf[match.end():]
+        if sentence:
+            yield sentence
+        while len(buf) >= MAX_SENTENCE_CHARS:
             cut = buf.rfind(" ", 0, MAX_SENTENCE_CHARS)
             if cut <= 0:
                 cut = MAX_SENTENCE_CHARS
-            sentence, buf = buf[:cut].strip(), buf[cut:]
-            if sentence:
-                yield sentence
+            head, buf = buf[:cut].strip(), buf[cut:]
+            if head:
+                yield head
     tail = buf.strip()
     if tail:
         yield tail
-
 
 def trim_silence(samples):
     # Kokoro pads every utterance with a stretch of near-silence. Left in place
@@ -263,7 +352,6 @@ def trim_silence(samples):
     end = min(samples.size, int(loud[-1]) + 1 + TTS_KEEP_SILENCE_SAMPLES)
     return samples[start:end]
 
-
 def apply_fades(samples):
     # A sentence that starts or ends on a non-zero sample clicks audibly when the
     # player concatenates it with the next one.
@@ -275,7 +363,6 @@ def apply_fades(samples):
     out[:n] *= ramp
     out[-n:] *= ramp[::-1]
     return out
-
 
 def normalize(samples):
     # Kokoro's output level varies between voices and between sentences, which
@@ -289,7 +376,6 @@ def normalize(samples):
     gain = min(max(TTS_TARGET_PEAK / peak, 0.5), 3.0)
     return samples * gain
 
-
 def to_pcm16_bytes(samples):
     if not samples.size:
         return b""
@@ -297,7 +383,6 @@ def to_pcm16_bytes(samples):
     # Round rather than truncate: astype() alone throws away up to a full LSB on
     # every sample, which is just added quantization noise.
     return np.round(clipped * 32767.0).astype(np.int16).tobytes()
-
 
 def synthesize_chunks(text):
     kokoro_lang_code, voice = detect_kokoro_target(text)
@@ -318,7 +403,6 @@ def synthesize_chunks(text):
         if pcm:
             yield pcm
 
-
 def handler(job):
     # Generator handler: every yielded dict is delivered to the relay through
     # RunPod's /stream endpoint as soon as it is produced, instead of the whole
@@ -336,7 +420,6 @@ def handler(job):
         yield {"type": "error", "message": "audio_base64 is required"}
         return
 
-    history = job_input.get("history", [])
     instructions = job_input.get("instructions")
     languages = job_input.get("languages")
 
@@ -352,10 +435,20 @@ def handler(job):
             yield {"type": "done"}
             return
 
+        # The target is the other language of the two-way session. Passing it
+        # explicitly (and re-checking the output) is what fixes JA->EN, where
+        # the model used to echo Japanese back and TTS then spoke Japanese.
+        target_language = other_language(detected_language, languages)
+        translated = translate(user_text, instructions, detected_language, target_language)
+        if not translated:
+            print("[handler] translation was empty", flush=True)
+            yield {"type": "done"}
+            return
+
         spoken_any = False
         last_sentence = None
         first = True
-        for sentence in stream_sentences(llm_deltas(history, user_text, system_prompt=instructions)):
+        for sentence in stream_sentences(translated):
             if first:
                 sentence = _LABEL_PREFIX.sub("", sentence)
                 first = False
@@ -385,6 +478,5 @@ def handler(job):
         traceback.print_exc()
         yield {"type": "error", "message": str(e)}
         yield {"type": "done"}
-
 
 runpod.serverless.start({"handler": handler, "return_aggregate_stream": True})
