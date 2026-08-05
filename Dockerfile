@@ -19,8 +19,13 @@ RUN wget -O /app/gemma-4-E4B-it-Q4_0.gguf \
 # starts never have to hit the Hugging Face Hub over the network (this was previously
 # happening on every fresh worker, adding highly variable and sometimes multi-minute delays,
 # worsened by unauthenticated-request rate limiting).
-ARG STT_MODEL_SIZE=base
-RUN python3 -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='Systran/faster-whisper-${STT_MODEL_SIZE}')"
+#
+# large-v3-turbo replaces the old "base" model: same encoder as large-v3 with a 4-layer
+# distilled decoder, so it is large-v3-class accurate (base was not, especially on
+# Japanese) while still fast enough for realtime. Resolve the repo through faster_whisper
+# instead of hardcoding a Systran/ id, because the turbo weights live under another org.
+ENV STT_MODEL_SIZE=large-v3-turbo
+RUN python3 -c "from faster_whisper.utils import download_model; download_model('large-v3-turbo')"
 RUN python3 -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='hexgrad/Kokoro-82M')"
 
 # misaki's Japanese G2P uses fugashi/MeCab, which needs the unidic dictionary data
